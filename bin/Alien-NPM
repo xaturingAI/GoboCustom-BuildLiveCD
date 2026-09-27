@@ -1,0 +1,152 @@
+#!/bin/sh
+#
+# Shell script implementing the Aliens interface for NPM (Node.js).
+#
+# Packages are installed into per-package prefix directories under
+#   /System/Aliens/NPM/<pkg>/
+# so that one package's dependency tree never collides with another's. The
+# bin/ subdirectory of each install is exposed at /System/Index/bin/ through
+# the standard Symlink_Aliens helper.
+#
+# Usage:
+#   Alien --install NPM:<pkg> [<version>]
+#   Alien --getversion NPM:<pkg>
+#   Alien --getinstallversion NPM:<pkg> [<lowver> [<upperver>]]
+#   Alien --greater-than NPM:<pkg> <ver>
+#   Alien --within-range NPM:<pkg> <lowver> [<upperver>]
+#   Alien --have-manager
+#   Alien --get-manager-rule
+#
+# Copyright 2026 GoboLinux contributors. Released under the GNU GPL 2 or later.
+
+. ScriptFunctions
+Import Alien
+Import OptionParser
+
+# The dispatcher `Alien` strips the `NPM:` prefix and exec's us as
+#   Alien-NPM <mode> <pkg> [<ver>]
+# but the plugin can also be called directly with `NPM:pkg` in $2 (useful
+# for testing and for callers that don't want to go through the
+# dispatcher). Strip the prefix up front so every helper sees a bare name.
+command="$1"
+prog="$2"
+case "$prog" in
+   NPM:*) prog="${prog#NPM:}" ;;
+esac
+
+# --- query helpers -----------------------------------------------------------
+
+getversion() {
+   # Read installed version of $1 from its per-package prefix.
+   # `npm ls --depth=0` prints a header line like
+   #   pkg@ /path/to/prefix
+   # then the package line itself, possibly with tree-drawing characters
+   # like `└── pkg@1.2.3`. We just regex for `pkg@<digits-and-dots>`.
+   prog="$1"
+   target="$goboSystem/Aliens/NPM/$prog"
+   [ -d "$target" ] || return 1
+   (cd "$target" && npm ls --depth=0 --no-color 2>/dev/null) \
+      | grep -o "${prog}@[0-9][0-9.]*" | head -1 | sed "s/^${prog}@//"
+}
+
+getinstallversion() {
+   # Pull available versions from the npm registry and pick one in range.
+   # Uses `npm view` (which speaks directly to the registry) so we don't need
+   # an extra JSON parser.
+   prog="$1"
+   lower="$2"
+   upper="$3"
+   # `--json` gives us a JSON array; pipe through node to parse.
+   versions=$(npm view "$prog" versions --json 2>/dev/null \
+              | node -e '
+                  let s="";process.stdin.on("data",c=>s+=c);
+                  process.stdin.on("end",()=>{
+                     try {
+                        const arr=JSON.parse(s);
+                        if (Array.isArray(arr))
+                           process.stdout.write(arr.join("\n")+"\n");
+                     } catch(e) {}
+                  });')
+   # Drop prereleases (anything containing '-' after the version digits).
+   for V in $versions
+   do
+      case "$V" in *-*) continue ;; esac
+      if In_Version_Range "$lower" "$V" "$upper"
+      then
+         echo "$V"
+         return 0
+      fi
+   done
+   return 1
+}
+
+# --- install -----------------------------------------------------------------
+
+install() {
+   prog="$1"
+   ver="$2"
+   local target="$goboSystem/Aliens/NPM/$prog"
+   if [ ! -d "$target" ]
+   then
+      mkdir -p "$target" || { echo "Alien-NPM: failed to create $target" >&2; exit 1; }
+   fi
+   if [ -n "$ver" ]
+   then
+      npm install --prefix "$target" "${prog}@${ver}" || {
+         echo "Alien-NPM: npm install failed for ${prog}@${ver}" >&2
+         exit 1
+      }
+   else
+      npm install --prefix "$target" "$prog" || {
+         echo "Alien-NPM: npm install failed for $prog" >&2
+         exit 1
+      }
+   fi
+   # Each per-package prefix has its own bin/; expose its entry points.
+   Symlink_Aliens "$goboExecutables" "$target/node_modules/.bin"
+}
+
+command="$1"
+prog="$2"
+
+# The dispatcher `Alien` strips the `NPM:` prefix and exec's us as
+#   Alien-NPM <mode> <pkg> [<ver>]
+# but the plugin can also be called directly with `NPM:pkg` in $2 (useful
+# for testing and for callers that don't want to go through the
+# dispatcher). Strip the prefix in that case.
+case "$prog" in
+   NPM:*) prog="${prog#NPM:}" ;;
+esac
+
+case "$command" in
+   --getversion)
+      echo $(getversion "$prog")
+      ;;
+   --getinstallversion)
+      getinstallversion "$prog" "$3" "$4"
+      ;;
+   --greater-than)
+      ver=$(getversion "$prog")
+      latest=$(GuessLatest "$ver" "$3")
+      [ "$latest" = "$3" ] && exit 1 || exit 0
+      ;;
+   --met|--within-range|--interval)
+      ver=$(getversion "$prog")
+      In_Version_Range "$3" "$ver" "$4"
+      ;;
+   --have-manager)
+      which npm >/dev/null 2>&1 || exit 1
+      ;;
+   --get-manager-rule)
+      echo "Node.js >= $(node --version 2>/dev/null | tr -d v)"
+      ;;
+   --install)
+      install "$prog" "$3"
+      ;;
+   --remove)
+      target="$goboSystem/Aliens/NPM/$prog"
+      [ -d "$target" ] || exit 0
+      rm -rf "$target"
+      Cleanup_Aliens
+      ;;
+esac

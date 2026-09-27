@@ -1,0 +1,49 @@
+#!/bin/bash
+
+source $(dirname $0)/CompatFunctions
+
+helpOnNoArguments=no
+scriptDescription="Downloads a prebuilt Proton redistributable and pre-bakes it into the Steam Live CD package."
+scriptCredits="Released under the GNU GPL."
+scriptUsage="[options]"
+
+Add_Option_Entry "v" "version" "Proton version to fetch (default: GE-Proton11-3)."
+Parse_Options "$@"
+
+proton_version=$(Entry "version")
+[ -z "$proton_version" ] && proton_version="GE-Proton11-3"
+
+root="$(readlink -f $(dirname $0)/..)"
+destdir="$root/Recipes/Steam/1.0.0.87_bin/Resources/Unmanaged/Users/root/.local/share/Steam/compatibilitytools.d"
+workdir="$(mktemp -d /tmp/AddProton-XXXXXX)"
+tarball="$proton_version.tar.gz"
+url="https://github.com/GloriousEggroll/proton-ge-custom/releases/download/$proton_version/$tarball"
+checksum_url="$url.sha512sum"
+
+trap 'rm -rf "$workdir"' EXIT
+
+Log_Normal "Downloading $url"
+wget -q "$url" -O "$workdir/$tarball" || Die "Failed to download $url"
+
+if wget -q "$checksum_url" -O "$workdir/$tarball.sha512sum"
+then
+   Quiet pushd "$workdir"
+   sha512sum -c "$tarball.sha512sum" || Die "Checksum verification failed for $tarball"
+   Quiet popd
+else
+   Log_Normal "No checksum file found; skipping verification."
+fi
+
+Log_Normal "Extracting $tarball"
+tar xzf "$workdir/$tarball" -C "$workdir" || Die "Failed to extract $tarball"
+[ -d "$workdir/$proton_version" ] || Die "Unexpected archive layout: $proton_version not found."
+
+mkdir -p "$destdir"
+rm -rf "$destdir/$proton_version"
+mv "$workdir/$proton_version" "$destdir/$proton_version"
+
+Log_Normal "Proton $proton_version pre-baked into:"
+Log_Normal "  $destdir/$proton_version"
+Log_Normal "Next steps:"
+Log_Normal "  CreatePackage Steam 1.0.0.87_bin"
+Log_Normal "  CompressAndBuildISO (to fold it into the Live CD)"

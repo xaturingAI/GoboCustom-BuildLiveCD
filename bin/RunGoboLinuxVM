@@ -1,0 +1,171 @@
+#!/bin/bash
+
+ISO="/home/nohearth/gobo-build/work/gobolinux.iso"
+WORK="/home/nohearth/gobo-build/work/qemu"
+DISK="$WORK/gobolinux.qcow2"
+DISK_SIZE=80
+GPU_BDF="0000:01:00.0"
+AUD_BDF="0000:01:00.1"
+MEM=8192
+SMP=4
+OVMF_CODE="/usr/share/edk2-ovmf/x64/OVMF_CODE.4m.fd"
+OVMF_VARS_SRC="/usr/share/edk2-ovmf/x64/OVMF_VARS.4m.fd"
+OVMF_VARS="$WORK/OVMF_VARS.4m.fd"
+
+run_root() {
+   if [ "$(id -u)" = 0 ]; then "$@"; else sudo -E "$@"; fi
+}
+
+usage() {
+   cat <<EOF
+Usage: $0 [install|run|restore] [<disk-size-G>]
+
+  install    Boot the GoboLinux ISO and install onto a new disk ($DISK).
+  run        Boot the installed virtual disk (this is the default once
+             the disk exists).
+  restore    Give the NVIDIA GPU back to the host (nvidia + snd-hda-intel
+             drivers) without rebooting.
+  <size>     Disk size in GB for a new install (default: $DISK_SIZE).
+
+With no arguments: if $DISK exists it boots it, otherwise it boots the ISO.
+The GPU binding done by this script is runtime-only: after a reboot the
+NVIDIA GPU is used by the host again as normal.
+
+The NVIDIA GPU (0000:01:00.0) and its audio (0000:01:00.1) are passed
+through to the guest via vfio-pci. They are bound to vfio-pci at runtime
+if needed. The host keeps using the Intel iGPU for display. The guest's
+picture appears on the physical monitor connected to the laptop's HDMI
+port (wired to the NVIDIA GPU). A QEMU virtual sound card provides guest
+audio over PipeWire/PulseAudio, and a virtual NIC gives the guest NAT
+internet access.
+EOF
+}
+
+die() {
+   echo "ERROR: $*" >&2
+   exit 1
+}
+
+[ -x /usr/bin/qemu-system-x86_64 ] || die "qemu-system-x86_64 not found (pacman -S qemu-desktop)"
+[ -e /dev/kvm ] || die "/dev/kvm not available - enable KVM"
+[ -f "$ISO" ] || die "ISO not found: $ISO"
+[ -f "$OVMF_CODE" ] || die "OVMF not found: pacman -S edk2-ovmf"
+
+MODE=""
+case "$1" in
+   install)   MODE=install; shift ;;
+   run)       MODE=run; shift ;;
+   restore)   MODE=restore; shift ;;
+   "")        [ -f "$DISK" ] && MODE=run || MODE=install ;;
+   -h|--help|help) usage; exit 0 ;;
+   *) die "unknown mode: $1 (install|run|restore)" ;;
+esac
+
+case "$1" in
+   "") ;;
+   *[!0-9]*) die "disk size must be a number of GB" ;;
+   *) DISK_SIZE="$1" ;;
+esac
+
+mkdir -p "$WORK"
+
+if ! [ -f "$DISK" ]; then
+   run_root /usr/bin/qemu-img create -f qcow2 "$DISK" "${DISK_SIZE}G" >/dev/null \
+      || die "could not create disk $DISK"
+   MODE=install
+fi
+
+[ -f "$OVMF_VARS" ] || run_root cp "$OVMF_VARS_SRC" "$OVMF_VARS"
+
+bind_vfio() {
+   run_root /usr/sbin/modprobe vfio-pci 2>/dev/null || true
+   for dev in "$GPU_BDF" "$AUD_BDF"; do
+      drv=$(basename "$(readlink -f "/sys/bus/pci/devices/$dev/driver" 2>/dev/null)" 2>/dev/null)
+      [ "$drv" = "vfio-pci" ] && continue
+      echo "Unbinding $dev from driver '$drv' and binding it to vfio-pci..."
+      if [ -n "$drv" ]; then
+         echo "$dev" | run_root tee "/sys/bus/pci/devices/$dev/driver/unbind" >/dev/null || true
+      fi
+      echo "vfio-pci" | run_root tee "/sys/bus/pci/devices/$dev/driver_override" >/dev/null
+      echo "$dev" | run_root tee "/sys/bus/pci/drivers_probe" >/dev/null
+   done
+   for dev in "$GPU_BDF" "$AUD_BDF"; do
+      drv=$(basename "$(readlink -f "/sys/bus/pci/devices/$dev/driver" 2>/dev/null)" 2>/dev/null)
+      [ "$drv" = "vfio-pci" ] || die "failed to bind $dev to vfio-pci (driver=${drv:-none})"
+   done
+}
+
+restore_gpu() {
+   for dev in "$GPU_BDF" "$AUD_BDF"; do
+      drv=$(basename "$(readlink -f "/sys/bus/pci/devices/$dev/driver" 2>/dev/null)" 2>/dev/null)
+      if [ "$drv" = "vfio-pci" ]; then
+         echo "Unbinding $dev from vfio-pci..."
+         echo "$dev" | run_root tee "/sys/bus/pci/devices/$dev/driver/unbind" >/dev/null || true
+      fi
+      echo "" | run_root tee "/sys/bus/pci/devices/$dev/driver_override" >/dev/null
+      echo "$dev" | run_root tee "/sys/bus/pci/drivers_probe" >/dev/null
+   done
+   for dev in "$GPU_BDF" "$AUD_BDF"; do
+      drv=$(basename "$(readlink -f "/sys/bus/pci/devices/$dev/driver" 2>/dev/null)" 2>/dev/null)
+      echo "$dev -> ${drv:-no driver}"
+   done
+}
+
+if [ "$MODE" = "restore" ]; then
+   restore_gpu
+   echo "NVIDIA GPU given back to the host. Reboot also works (runtime binding never survives a reboot)."
+   exit 0
+fi
+
+drv=$(basename "$(readlink -f "/sys/bus/pci/devices/$GPU_BDF/driver" 2>/dev/null)" 2>/dev/null)
+if [ "$drv" != "vfio-pci" ]; then
+   bind_vfio
+fi
+
+PULSE_SRV="${PULSE_SERVER:-$XDG_RUNTIME_DIR/pulse/native}"
+AUDIO_PA=()
+if [ -S "$PULSE_SRV" ]; then
+   AUDIO_PA=("server=$PULSE_SRV")
+fi
+
+QEMU=(
+   /usr/bin/qemu-system-x86_64
+   -name GoboLinux,process=gobolinux-vm
+   -machine q35,accel=kvm
+   -cpu host
+   -smp "$SMP"
+   -m "$MEM"
+   -nodefaults
+   -vga none
+   -device vfio-pci,host="$GPU_BDF",multifunction=on
+   -device vfio-pci,host="$AUD_BDF"
+   -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE"
+   -drive if=pflash,format=raw,file="$OVMF_VARS"
+   -audiodev pa,id=audio0,${AUDIO_PA[0]+"${AUDIO_PA[0]}"}
+   -device intel-hda,id=snd0,bus=pcie.0
+   -device hda-duplex,audiodev=audio0
+   -device qemu-xhci,id=usb
+   -device usb-tablet
+   -netdev user,id=net0
+   -device virtio-net-pci,netdev=net0
+   -drive file="$DISK",if=ide,format=qcow2
+)
+
+if [ "$MODE" = "install" ]; then
+   QEMU+=(
+      -boot d
+      -drive file="$ISO",media=cdrom,format=raw,readonly=on,if=ide
+   )
+else
+   QEMU+=(-boot c)
+fi
+
+echo
+echo "==> Launching GoboLinux VM in $MODE mode"
+echo "    Disk:    $DISK"
+echo "    GPU:     $GPU_BDF passed through (vfio-pci)"
+echo "    Audio:   virtual HDA over PipeWire/Pulse"
+echo "    Network: user-mode NAT (guest 10.0.2.15, internet via host)"
+echo "    Video:   look at the monitor on the laptop HDMI port"
+echo
+run_root "${QEMU[@]}"

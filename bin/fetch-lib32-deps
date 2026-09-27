@@ -1,0 +1,142 @@
+#!/bin/bash
+# fetch-lib32-deps: Download all required i386 Debian packages for 32-bit gaming
+# libraries into a staging directory. Run once on the host or in the chroot
+# before building the lib32-* recipes.
+#
+# Usage: bin/fetch-lib32-deps [staging_dir]
+# Default staging_dir: /tmp/lib32-deps
+
+set -euo pipefail
+
+STAGE="${1:-/tmp/lib32-deps}"
+DEB_MIRROR="https://deb.debian.org/debian"
+DEB_SECURITY="https://security.debian.org/debian-security"
+
+mkdir -p "$STAGE"
+
+# List of i386 packages needed for 32-bit Steam/Wine/gaming.
+# Format: package_name  debian_version  source_pool
+# source_pool: "main" or "security"
+PACKAGES=(
+    # X11 core
+    "libx11-6 2:1.8.7-1 main"
+    "libx11-xcb1 1.15-1 main"
+    "libxcb1 1.15-1 main"
+    "libxcb-render0 1.15-1 main"
+    "libxcb-shm0 1.15-1 main"
+    "libxcb-shape0 1.15-1 main"
+    "libxcb-xfixes0 1.15-1 main"
+    "libxcb-xinerama0 1.15-1 main"
+    "libxcb-xkb1 1.15-1 main"
+    "libxcb-keysyms1 0.4.0-1 main"
+    "libxcb-image0 0.4.0-2 main"
+    "libxcb-util1 0.4.0-1 main"
+    "libxau6 1:1.0.9-1 main"
+    "libxdmcp6 1:1.1.3-1 main"
+
+    # X11 extensions
+    "libxext6 2:1.3.4-1+b1 main"
+    "libxfixes3 1:5.0.3-2+b1 main"
+    "libxrandr2 2:1.5.3-1+b1 main"
+    "libxinerama1 2:1.1.4-1+b1 main"
+    "libxcursor1 1:1.2.1-1+b1 main"
+    "libxi6 2:1.8.1-1+b1 main"
+    "libxcomposite1 1:0.4.5-1+b1 main"
+    "libxdamage1 1:1.1.6-1+b1 main"
+    "libxss1 1:1.2.3-1+b1 main"
+    "libxtst6 2:1.2.3-1+b1 main"
+
+    # XKB
+    "libxkbcommon0 1.5.0+ds1-1 main"
+
+    # D-Bus
+    "libdbus-1-3 1.14.10-2~deb12u1 main"
+
+    # Font rendering
+    "libfreetype6 2.12.1+dfsg-5+deb12u3 main"
+    "libfontconfig1 2.13.1-4.2 main"
+    "libfontenc1 1:1.1.4-1+b2 main"
+
+    # Compression / image
+    "zlib1g 1:1.2.13.dfsg-2 main"
+    "libpng16-16 1.6.37-3.1+deb12u1 main"
+    "libtiff6 4.5.0-6+deb12u1 main"
+    "libjpeg62-turbo 2.1.5-2+deb12u1 main"
+
+    # XML
+    "libxml2 2.9.14+dfsg-1.3~deb12u7 main"
+    "libexpat1 2.5.0-1+deb12u1 main"
+
+    # Audio
+    "libasound2 1.2.8-1+b1 main"
+    "libpulse0 16.0+dfsg1-2 main"
+
+    # GLVND (32-bit GL dispatch — needed for Vulkan/Wine GL)
+    "libglvnd0 1.4.0-8 main"
+    "libglx0 1.4.0-8 main"
+    "libegl1 1.4.0-8 main"
+    "libgles1 1.4.0-8 main"
+    "libgles2 1.4.0-8 main"
+    "libgl1 1.4.0-8 main"
+    "libopengl0 1.4.0-8 main"
+
+    # Vulkan (loader — ICDs are provided by Nvidia)
+    "libvulkan1 1.3.275.0-1 main"
+
+    # Misc
+    "libuuid1 2.38.1-5+deb12u1 main"
+    "libgcrypt20 1.10.1-3+deb12u1 main"
+    "libgpg-error0 1.46-2 main"
+)
+
+download_package() {
+    local pkg="$1" ver="$2" pool="$3"
+    local deb_name="${pkg}_${ver}_i386.deb"
+    local url
+    if [ "$pool" = "security" ]; then
+        url="${DEB_SECURITY}/pool/updates/main/${pkg:0:1}/${pkg}/${deb_name}"
+    else
+        # First letter grouping for main pool
+        local first="${pkg:0:1}"
+        url="${DEB_MIRROR}/pool/main/${first}/${pkg}/${deb_name}"
+    fi
+    local dest="${STAGE}/${deb_name}"
+
+    if [ -f "$dest" ]; then
+        echo "  EXISTS: $deb_name"
+        return 0
+    fi
+
+    echo "  GET: $deb_name"
+    if curl -sfL -o "$dest" "$url"; then
+        return 0
+    fi
+
+    # Try security pool as fallback if main failed
+    if [ "$pool" = "main" ]; then
+        local sec_url="${DEB_SECURITY}/pool/updates/main/${first}/${pkg}/${deb_name}"
+        echo "  RETRY: $deb_name (security)"
+        if curl -sfL -o "$dest" "$sec_url"; then
+            return 0
+        fi
+    fi
+
+    echo "  FAILED: $deb_name"
+    rm -f "$dest"
+    return 1
+}
+
+echo "=== Fetching i386 packages to $STAGE ==="
+failed=0
+for entry in "${PACKAGES[@]}"; do
+    read -r pkg ver pool <<< "$entry"
+    if ! download_package "$pkg" "$ver" "$pool"; then
+        failed=$((failed + 1))
+    fi
+done
+
+echo ""
+echo "=== Done: ${#PACKAGES[@]} packages, $failed failed ==="
+echo "Staging directory: $STAGE"
+ls -la "$STAGE"/*.deb 2>/dev/null | wc -l
+echo "deb files downloaded"

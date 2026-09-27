@@ -1,0 +1,152 @@
+#!/bin/sh
+#
+# Shell script implementing the Aliens interface for Cargo (Rust).
+#
+# Crates are installed into a single shared root at /System/Aliens/Cargo/
+# (cargo install --root). The bin/ subdirectory is exposed at
+# /System/Index/bin/ through the standard Symlink_Aliens helper.
+#
+# This mirrors the shape of Alien-LuaRocks: one shared tree because cargo's
+# resolver is happy to share toolchain state, and individual crates rarely
+# ship conflicting binaries.
+#
+# Usage:
+#   Alien --install CARGO:<crate> [<version>]
+#   Alien --getversion CARGO:<crate>
+#   Alien --getinstallversion CARGO:<crate> [<lowver> [<upperver>]]
+#   Alien --greater-than CARGO:<crate> <ver>
+#   Alien --within-range CARGO:<crate> <lowver> [<upperver>]
+#   Alien --have-manager
+#   Alien --get-manager-rule
+#
+# Copyright 2026 GoboLinux contributors. Released under the GNU GPL 2 or later.
+
+. ScriptFunctions
+Import Alien
+Import OptionParser
+
+CARGO_ROOT="$goboSystem/Aliens/Cargo"
+
+# Accept both `Alien-Cargo --mode <crate>` (dispatcher form) and
+# `Alien-Cargo --mode CARGO:<crate>` (direct form, useful for tests).
+command="$1"
+prog="$2"
+case "$prog" in
+   CARGO:*) prog="${prog#CARGO:}" ;;
+esac
+
+# --- query helpers -----------------------------------------------------------
+
+getversion() {
+   # `cargo install --list` output is one line per crate, e.g.
+   #   ripgrep v14.1.0:
+   prog="$1"
+   cargo install --list --root "$CARGO_ROOT" 2>/dev/null \
+      | awk -v p="$prog" '
+            $1 == p {
+               v = $2
+               sub(/^v/, "", v)
+               sub(/:$/, "", v)
+               print v
+               exit
+            }'
+}
+
+getinstallversion() {
+   # Pull versions from crates.io's REST API. We hit /api/v1/crates/<name>
+   # which returns a JSON envelope whose `versions` array lists every release.
+   prog="$1"
+   lower="$2"
+   upper="$3"
+   # Try `node` first (almost certainly present alongside cargo in modern
+   # toolchains); fall back to `python3` if not.
+   parse() {
+      node -e '
+         let s="";process.stdin.on("data",c=>s+=c);
+         process.stdin.on("end",()=>{
+            try {
+               const j=JSON.parse(s);
+               if (j && Array.isArray(j.versions)) {
+                  for (const v of j.versions) {
+                     if (!v.yanked) process.stdout.write(v.num+"\n");
+                  }
+               }
+            } catch(e) {}
+         });' 2>/dev/null
+   }
+   # crates.io rejects requests without a User-Agent (403), so send one.
+   versions=$(curl -sS --max-time 10 -A "GoboLinux Alien-Cargo (gobolinux.org)" "https://crates.io/api/v1/crates/$prog" 2>/dev/null | parse)
+   for V in $versions
+   do
+      if In_Version_Range "$lower" "$V" "$upper"
+      then
+         echo "$V"
+         return 0
+      fi
+   done
+   return 1
+}
+
+# --- install -----------------------------------------------------------------
+
+install() {
+   prog="$1"
+   ver="$2"
+   if [ ! -d "$CARGO_ROOT" ]
+   then
+      mkdir -p "$CARGO_ROOT" || {
+         echo "Alien-Cargo: failed to create $CARGO_ROOT" >&2; exit 1
+      }
+   fi
+   if [ -n "$ver" ]
+   then
+      cargo install --root "$CARGO_ROOT" "$prog" --version "$ver" || {
+         echo "Alien-Cargo: cargo install failed for ${prog}@${ver}" >&2
+         exit 1
+      }
+   else
+      cargo install --root "$CARGO_ROOT" "$prog" || {
+         echo "Alien-Cargo: cargo install failed for $prog" >&2
+         exit 1
+      }
+   fi
+   # cargo install --root puts binaries in $root/bin.
+   Symlink_Aliens "$goboExecutables" "$CARGO_ROOT/bin"
+}
+
+# --- dispatcher --------------------------------------------------------------
+
+case "$command" in
+   --getversion)
+      echo $(getversion "$prog")
+      ;;
+   --getinstallversion)
+      getinstallversion "$prog" "$3" "$4"
+      ;;
+   --greater-than)
+      ver=$(getversion "$prog")
+      latest=$(GuessLatest "$ver" "$3")
+      [ "$latest" = "$3" ] && exit 1 || exit 0
+      ;;
+   --met|--within-range|--interval)
+      ver=$(getversion "$prog")
+      In_Version_Range "$3" "$ver" "$4"
+      ;;
+   --have-manager)
+      which cargo >/dev/null 2>&1 || exit 1
+      ;;
+   --get-manager-rule)
+      rustver=$(rustc --version 2>/dev/null | awk '{print $2}')
+      [ -n "$rustver" ] || rustver="1.0"
+      echo "Rust >= $rustver"
+      ;;
+   --install)
+      install "$prog" "$3"
+      ;;
+   --remove)
+      # cargo install --root doesn't track individual uninstalls; the user
+      # should `rm -rf $CARGO_ROOT` to wipe the tree.
+      echo "Alien-Cargo: remove not implemented; rm -rf $CARGO_ROOT to wipe" >&2
+      exit 1
+      ;;
+esac

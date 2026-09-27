@@ -1,0 +1,260 @@
+#!/bin/bash
+
+source $(dirname $0)/CompatFunctions
+
+if [ "$1" == "--help" ]
+then
+   echo "Usage:"
+   echo "   UpdateEnvironment"
+   echo
+   echo "Run this on an empty directory to create the"
+   echo "GoboLinux LiveCD mastering environment."
+   echo "It will fetch all needed files off the network"
+   echo "and create the proper directory layout."
+   echo
+   exit 0
+fi
+
+Parse_Conf BuildLiveCD.conf
+
+root=$PWD
+output=$PWD/Output
+archives=$PWD/Archives
+cdbootloaderdir="$(readlink -f $(dirname $0)/../CD-Bootloader)"
+isolinuxdir="$cdbootloaderdir/isolinux"
+ppmfile="$isolinuxdir/gobolinux016.01.ppm"
+builddir="$PWD/TemporaryBuild"
+mkdir -p "$builddir" "$archives"
+
+datadir="$(readlink -f $(dirname $0)/../Data)"
+if [ -d "$datadir" ]
+then
+   Quiet pushd "$datadir"
+   [ -d .git ] && git pull
+   Quiet popd
+fi
+
+#############################################################################
+# CD Bootloader and BusyBox
+#############################################################################
+
+function DownloadLatest() {
+   local url="$1"
+   local filename="$2"
+   local extension="$3"
+   local archive=$(wget -q "$url" -O - | grep "$filename" | grep "$extension\"" | tail -n1 | sed 's,\(.*\)href=\(.\),\2,g' | cut -d\" -f2)
+   wget -q "$url/$archive" -O "$builddir/$archive"
+}
+
+function UnpackArchive() {
+   local archive="$1"
+   local archiveDir=$(echo "$archive" | sed 's,\.tar.*,,g')
+   if [ ! -d "$archiveDir" ]
+   then
+      case "$archive" in
+         *.tar.gz)  tar zxvf "$archive" >&2 ;;
+         *.tar.xz)  tar Jxvf "$archive" >&2 ;;
+         *.tar.bz2) tar jxvf "$archive" >&2 ;;
+         *) echo "File $archive has unsupported extension. Please fix this in the UpdateEnvironment script." >&2 ;;
+      esac
+   fi
+   echo "$archiveDir"
+}
+
+function BuildISOLINUX() {
+   local archiveDir="$1"
+   local installDir="$2"
+   local ppmFile="$3"
+   local makeFlags="bios"
+
+   if [ ! -e /usr/local/lib/libgnuefi.a -a ! -e /usr/lib/libgnuefi.a ]
+   then
+      echo "*****************************************************************************"
+      echo "Warning: GNU-EFI does not seem to be installed in your host operating system."
+      echo "Failing to meet this dependency will prevent ISOLINUX from being built."
+      echo "*****************************************************************************"
+      echo
+      echo "Press any key to continue."
+      read
+   fi
+
+   Quiet pushd "$archiveDir"
+   # Patch
+   if ! grep -q "/Programs" efi/find-gnu-efi.sh
+   then
+      GrepReplace "^include_dirs=\"" "include_dirs=\"/Programs/GNU-EFI/Current/include " efi/find-gnu-efi.sh
+      GrepReplace "^lib_dirs=\"" "lib_dirs=\"/Programs/GNU-EFI/Current/lib " efi/find-gnu-efi.sh
+   fi
+   # Set build flags
+   case $(uname -m) in
+       i686)   makeFlags="bios efi32" ;;
+       x86_64) makeFlags="bios efi64" ;;
+       *)      echo "Unknown architecture $(uname -m). Please patch the UpdateEnvironment script." ;;
+   esac
+   # Build
+   make $makeFlags
+   Quiet popd
+}
+
+function InstallISOLINUX() {
+   local archiveDir="$1"
+   local installDir="$2"
+   local ppmFile="$3"
+ 
+   # BIOS
+   local bios_loaders=(
+       bios/core/isolinux.bin                  # BIOS loader
+       bios/com32/elflink/ldlinux/ldlinux.c32  # Dependency. Must be installed on the same directory
+   )
+   local bios_modules=(
+       bios/com32/menu/vesamenu.c32            # VESA graphics menu
+       bios/com32/lib/libcom32.c32             # VESA graphics menu dependency
+       bios/com32/libutil/libutil.c32          # VESA graphics menu dependency
+   )
+   # EFI 32-bit (not supported yet)
+   local efi32_loaders=(
+       efi32/efi/syslinux.efi
+       efi32/com32/elflink/ldlinux/ldlinux.e32
+   )
+   local efi32_modules=(
+       efi32/com32/menu/vesamenu.c32
+       efi32/com32/lib/libcom32.c32
+       efi32/com32/libutil/libutil.c32
+   )
+   # EFI 64-bit (not supported yet)
+   local efi64_loaders=(
+       efi64/efi/syslinux.efi
+       efi64/com32/elflink/ldlinux/ldlinux.e64
+   )
+   local efi64_modules=(
+       efi64/com32/menu/vesamenu.c32
+       efi64/com32/lib/libcom32.c32
+       efi64/com32/libutil/libutil.c32
+   )
+
+   Quiet pushd "$archiveDir"
+   case "$(uname -m)" in
+       i686|x86_64)
+           mkdir -p "$installDir/isolinux/bios"
+           cp -v ${bios_loaders[@]} "$installDir/isolinux"
+           cp -v ${bios_modules[@]} "$installDir/isolinux/bios"
+           sed -i 's,__ARCH__,bios,g' "$installDir/isolinux/isolinux.cfg"
+           sed -i 's,__ARCH__,bios,g' "$installDir/isolinux/advanced.cfg"
+           ;;
+       TODO_x86_64_EFI_mode)
+           # TODO: we need to create an .img file to pass to mkisofs if we are to boot using pure EFI
+           mkdir -p "$installDir/isolinux/efi64"
+           cp -v ${efi_loaders[@]} "$installDir/isolinux"
+           cp -v ${efi_modules[@]} "$installDir/isolinux/efi64"
+           sed -i 's,__ARCH__,efi64,g' "$installDir/isolinux/isolinux.cfg"
+           sed -i 's,__ARCH__,efi64,g' "$installDir/isolinux/advanced.cfg"
+           ;;
+       *)
+           echo "Error: unsupported architecture $(uname -m)."
+           exit 1
+           ;;
+   esac
+   
+   # Boot logo
+   utils/ppmtolss16 < "$ppmFile" > "$installDir/isolinux/gobo.lss"
+
+   Quiet popd
+}
+
+function BuildBusyBox() {
+   local archiveDir="$1"
+   local version=$(basename $archiveDir | sed 's,busybox-,,g')
+   local installDir="$2/$version"
+
+   mkdir -p "$installDir"
+   Quiet pushd "$archiveDir"
+   if [ ! -e ".config" -o "$datadir/busybox.config" -nt ".config" ]
+   then
+      cp -v "$datadir/busybox.config" ".config"
+      yes "" | make oldconfig
+   fi
+   GrepReplace "CONFIG_PREFIX=.*" "CONFIG_PREFIX=\"$installDir\"" .config
+   ln -nfs "$version" "$2/Current"
+   make && make install
+   Quiet popd
+}
+
+echo "=> Building the CD bootloader..."
+
+# Create the ISO work directory
+if [ ! -d "$output/ISO/isolinux" ]
+then
+   mkdir -p $output/ISO/isolinux
+   cp -a "$cdbootloaderdir/"* $output/ISO
+   find $output/ISO -name ".git" -type d | xargs rm -rf
+fi
+
+# Build ISOLINUX
+if [ ! -e "$output/ISO/isolinux/isolinux.bin" ]
+then
+   #DownloadLatest "https://www.kernel.org/pub/linux/utils/boot/syslinux/" "syslinux" "tar.xz"
+   DownloadLatest "https://www.kernel.org/pub/linux/utils/boot/syslinux/Testing/6.04" "syslinux" "tar.xz"
+   Quiet pushd "$builddir"
+   archiveDir="$(UnpackArchive $(ls syslinux*.tar.xz | tail -n1))"
+   Quiet popd
+   # BuildISOLINUX "$builddir/$archiveDir" "$output/ISO" "$ppmfile"  # We are using the executables shipped with isolinux
+   InstallISOLINUX "$builddir/$archiveDir" "$output/ISO" "$ppmfile"
+fi
+
+# Build BusyBox
+if [ $(ls $archives/BusyBox-InitRD--* 2> /dev/null | wc -l) = 0 ]
+then
+   DownloadLatest "http://sources.buildroot.net/" "busybox-1" "tar.bz2"
+   Quiet pushd "$builddir"
+   archiveDir="$(UnpackArchive $(ls busybox-1*.tar.bz2 | tail -n1))"
+   Quiet popd
+   BuildBusyBox "$builddir/$archiveDir" "$builddir/BusyBox-InitRD"
+   Quiet pushd "$builddir"
+   tar cjf $archives/BusyBox-InitRD--$(ls BusyBox-InitRD/ | head -n1)--$(uname -m).tar.bz2 BusyBox-InitRD
+   Quiet popd
+fi
+
+#############################################################################
+# LocalGit
+#############################################################################
+echo "=> Updating local Git copy..."
+
+mkdir -p $root/LocalGit/tools
+cd $root/LocalGit/
+
+if [ -e $datadir/Packages-List-GoboLinuxTools-Git ]
+then tools="`cat $datadir/Packages-List-GoboLinuxTools-Git` InitRDScripts"
+else tools="InitRDScripts"
+fi
+
+for gitrepo in $tools
+do
+   if [ -e "tools/$gitrepo" ]
+   then
+      echo "Updating $gitrepo..."
+      cd tools/$gitrepo
+      git pull
+      cd - &> /dev/null
+   else
+      echo "Getting $gitrepo..."
+      pushd tools
+      git clone https://github.com/gobolinux/$gitrepo
+      popd
+   fi
+done
+
+if [ -e "files" ]
+then
+   echo "Updating Files..."
+   cd files
+   git pull
+   cd - &> /dev/null
+else
+   echo "Getting Files..."
+   git clone https://github.com/gobolinux/Files
+   mv Files files
+fi
+
+rm -rf files/Documentation
+
+echo "=> Done."

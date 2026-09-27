@@ -1,0 +1,152 @@
+#!/bin/sh
+#
+# Shell script implementing the Aliens interface for Odin.
+#
+# Odin has no official centralized package registry; the community distributes
+# code as git repositories (e.g. github.com/odin-lang/odin-extras) pinned to a
+# commit, tag or branch. This backend therefore treats the package name as a
+# git URL/`owner/repo` reference and installs it into /System/Aliens/Odin/<repo>/
+# as a plain clone, recording the checked-out reference in $target/VERSION.
+# The Go import path style (host/user) maps to https://github.com/host/user.git.
+#
+# Query modes are necessarily shallow compared to registry-backed managers:
+#   --getversion        reports the resolved tag/commit (from VERSION).
+#   --getinstallversion lists remote tags via `git ls-remote --tags`.
+#   --install           clones the repo (optionally at a tag).
+#
+# Usage:
+#   Alien --install ODIN:<owner/repo> [<tag>]
+#   Alien --getversion ODIN:<owner/repo>
+#   Alien --getinstallversion ODIN:<owner/repo> [<lowver> [<upperver>]]
+#   Alien --greater-than ODIN:<owner/repo> <ver>
+#   Alien --within-range ODIN:<owner/repo> <lowver> [<upperver>]
+#   Alien --have-manager
+#   Alien --get-manager-rule
+#
+# Copyright 2026 GoboLinux contributors. Released under the GNU GPL 2 or later.
+
+. ScriptFunctions
+Import Alien
+Import OptionParser
+
+ODIN_ROOT="$goboSystem/Aliens/Odin"
+
+# Accept both `Alien-Odin --mode <pkg>` (dispatcher form) and
+# `Alien-Odin --mode ODIN:<pkg>` (direct form, useful for tests).
+command="$1"
+prog="$2"
+case "$prog" in
+   ODIN:*) prog="${prog#ODIN:}" ;;
+esac
+
+# Normalize "owner/repo" to the canonical github clone URL; leave full URLs alone.
+repo_url() {
+   case "$1" in
+      *://*) echo "$1" ;;
+      */*)   echo "https://github.com/$1.git" ;;
+      *)     echo "https://github.com/$1/$1.git" ;;
+   esac
+}
+
+repo_dir() {
+   echo "$ODIN_ROOT/$(basename "$1" .git)"
+}
+
+# --- query helpers -----------------------------------------------------------
+
+getversion() {
+   # A directory clone was installed; read the reference we recorded.
+   prog="$1"
+   dir="$ODIN_ROOT/$(basename "$prog" .git)"
+   [ -f "$dir/VERSION" ] || return 1
+   cat "$dir/VERSION"
+}
+
+getinstallversion() {
+   # Enumerate remote tags; latest wins on release-like (vX.Y.Z) ordering.
+   prog="$1"
+   lower="$2"
+   upper="$3"
+   url=$(repo_url "$prog")
+   out=$(git ls-remote --tags "$url" 2>/dev/null)
+   [ -n "$out" ] || return 1
+   # Reformat "refs/tags/v1.2.3^{}" -> "1.2.3"
+   tags=$(echo "$out" | sed -n 's#.*refs/tags/v\?\([0-9][0-9.]*\).*#\1#p' | sort -u)
+   for V in $tags
+   do
+      if In_Version_Range "$lower" "$V" "$upper"
+      then
+         echo "$V"
+         return 0
+      fi
+   done
+   return 1
+}
+
+# --- install -----------------------------------------------------------------
+
+install() {
+   prog="$1"
+   ver="$2"
+   if [ ! -d "$ODIN_ROOT" ]
+   then
+      mkdir -p "$ODIN_ROOT" || {
+         echo "Alien-Odin: failed to create $ODIN_ROOT" >&2; exit 1
+      }
+   fi
+   dir=$(repo_dir "$prog")
+   url=$(repo_url "$prog")
+   rm -rf "$dir"
+   if [ -n "$ver" ]
+   then
+      git clone --depth 1 --branch "$ver" "$url" "$dir" 2>/dev/null || {
+         git clone --depth 1 --branch "v$ver" "$url" "$dir" 2>/dev/null || {
+            echo "Alien-Odin: git clone failed for ${prog}@${ver}" >&2
+            exit 1
+         }
+      }
+      printf "%s\n" "$ver" > "$dir/VERSION"
+   else
+      git clone --depth 1 "$url" "$dir" 2>/dev/null || {
+         echo "Alien-Odin: git clone failed for $prog" >&2
+         exit 1
+      }
+      git -C "$dir" rev-parse --short HEAD > "$dir/VERSION" 2>/dev/null
+   fi
+}
+
+# --- dispatcher --------------------------------------------------------------
+
+case "$command" in
+   --getversion)
+      echo $(getversion "$prog")
+      ;;
+   --getinstallversion)
+      getinstallversion "$prog" "$3" "$4"
+      ;;
+   --greater-than)
+      ver=$(getversion "$prog")
+      latest=$(GuessLatest "$ver" "$3")
+      [ "$latest" = "$3" ] && exit 1 || exit 0
+      ;;
+   --met|--within-range|--interval)
+      ver=$(getversion "$prog")
+      In_Version_Range "$3" "$ver" "$4"
+      ;;
+   --have-manager)
+      which odin >/dev/null 2>&1 || exit 1
+      ;;
+   --get-manager-rule)
+      over=$(odin version 2>/dev/null | grep -o 'dev-[0-9-]*')
+      [ -n "$over" ] || over="dev"
+      echo "Odin >= $over"
+      ;;
+   --install)
+      install "$prog" "$3"
+      ;;
+   --remove)
+      dir=$(repo_dir "$prog")
+      [ -d "$dir" ] && rm -rf "$dir"
+      Cleanup_Aliens
+      ;;
+esac

@@ -1,0 +1,69 @@
+#!/bin/bash
+
+scriptName="ChrootEnvironment"
+source $(dirname $0)/CompatFunctions
+
+if [ ! -d "Output/ROLayer" ]
+then
+   echo "Error: Output/ROLayer doesn't exist."
+   echo "Please run CompressAndBuildISO prior before trying to ChrootEnvironment"
+   exit 1
+fi
+
+if [ "$UID" != "0" ]
+then
+    echo "Running as superuser."
+    exec sudo -u "#0" $0 $*
+fi
+
+chroot_layers=(
+   "Output/RWLayer=RW"
+   "Output/ROLayer=RO"
+)
+unionfs_dirs=`echo "${chroot_layers[@]}" | tr " " ":"`
+mp="Output/Environment"
+mkdir -p Output/RWLayer/Data/Variable/tmp
+mkdir -p $mp
+
+Log_Normal "Unionfs mounting layers."
+unionfs -o "hide_meta_files,cow,dirs=${unionfs_dirs}" ${mp} || { echo Error mounting Output/Environment; exit 1; }
+
+# Convenience access to directories from the host environment
+mkdir -p Output/Chroot_Mount_CD-ROM
+mount -o bind Output/Chroot_Mount_CD-ROM ${mp}/Mount/CD-ROM
+mount -o bind /dev ${mp}/System/Kernel/Devices
+mount -o bind /proc ${mp}/System/Kernel/Status
+
+chroot ${mp} ldconfig
+if [ $# = 1 ]
+then
+   Log_Normal "Chrooting into ${mp}"
+   chroot ${mp} /bin/bash
+else
+   chroot ${mp} "$@"
+fi
+sync
+
+#####################################################################
+
+Log_Verbose "Cleaning up /tmp..."
+rm -fr -- ${mp}/tmp/*
+rmdir Output/RWLayer/Data/Variable/tmp 2> /dev/null
+
+Log_Verbose "Unmounting:"
+mp_path=`readlink -f ${mp}`
+cat /proc/mounts | tac | cut -d' ' -f2 | grep $mp_path | while read dir
+do
+   Log_Verbose "  ${dir}"
+   umount "${dir}"
+done
+
+rmdir ${mp}
+rmdir --ignore-fail-on-non-empty -p Output/Chroot_Mount_CD-ROM
+
+# additional things to check before releasing a LiveCD
+# cd /Programs/; time for i in *; do echo $i; mkdir $i/Current/Resources/; Dependencies $i > $i/Current/Resources/Dependencies; done
+# cd /Programs/; grep Warn */Current/Resources/Dependencies
+# cd /Programs/; du --max-depth=1 > /Depot/Install/Wizard/Auxiliary/Programs_du.txt
+# for i in `cat /Programs/Installer/Current/Shared/Installer/Profiles/Typical`; do [ -d "/Programs/$i" ] || echo $i; done
+# for i in `cat /Programs/Installer/Current/Shared/Installer/Profiles/Base`;    do [ -d "/Programs/$i" ] || echo $i; done

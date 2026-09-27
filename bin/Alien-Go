@@ -1,0 +1,155 @@
+#!/bin/sh
+#
+# Shell script implementing the Aliens interface for Go modules.
+#
+# Module binaries are installed into a single shared root at
+# /System/Aliens/Go/bin (via `go install` with GOBIN pointing there). The bin/
+# directory is exposed at /System/Index/bin/ through the standard
+# Symlink_Aliens helper.
+#
+# Module names may be a plain import path like `golang.org/x/tools/cmd/goimports`
+# or a git repo reference like `github.com/heroku/hk@latest`. Version requests go
+# through the proxy.golang.org registry, whose /@v/list endpoint returns the
+# published versions for a module path.
+#
+# Usage:
+#   Alien --install GO:<module> [<version>]
+#   Alien --getversion GO:<module>
+#   Alien --getinstallversion GO:<module> [<lowver> [<upperver>]]
+#   Alien --greater-than GO:<module> <ver>
+#   Alien --within-range GO:<module> <lowver> [<upperver>]
+#   Alien --have-manager
+#   Alien --get-manager-rule
+#
+# Copyright 2026 GoboLinux contributors. Released under the GNU GPL 2 or later.
+
+. ScriptFunctions
+Import Alien
+Import OptionParser
+
+GO_BIN="$goboSystem/Aliens/Go/bin"
+
+# Accept both `Alien-Go --mode <module>` (dispatcher form) and
+# `Alien-Go --mode GO:<module>` (direct form, useful for tests).
+command="$1"
+prog="$2"
+case "$prog" in
+   GO:*) prog="${prog#GO:}" ;;
+esac
+
+# The version-suffixed @latest may be given inside the name; strip it so the
+# registry/install calls get a bare path and the version flag stays separate.
+prog="${prog%@latest}"
+
+# --- query helpers -----------------------------------------------------------
+
+getversion() {
+   # `go install` writes the binary named after the last path element. Its
+   # module version is embedded in the build info, readable via `go version -m`.
+   # Normalize away the canonical 'v' prefix so range math (GuessLatest /
+   # In_Version_Range) compares plain MAJOR.MINOR.PATCH numbers.
+   prog="$1"
+   bin="$GO_BIN/$(basename "$prog")"
+   [ -x "$bin" ] || return 1
+   go version -m "$bin" 2>/dev/null \
+      | awk '$1 == "mod" { print $3; exit }' \
+      | sed 's/^v//'
+}
+
+getinstallversion() {
+   # Prefer `go list -m -versions` (handles both module and sub-package paths
+   # and validates the name via the real toolchain); fall back to the proxy's
+   # /@v/list endpoint for plain module paths.
+   prog="$1"
+   lower="$2"
+   upper="$3"
+   versions=$(GO111MODULE=on timeout 30 go list -m -versions "$prog" 2>/dev/null \
+                | awk '{ for (i = 2; i <= NF; i++) print $i }')
+   if [ -z "$versions" ]
+   then
+      # Module paths are lowercase by convention; the proxy enforces this.
+      versions=$(curl -sS --max-time 10 -A "GoboLinux Alien-Go (gobolinux.org)" \
+                    "https://proxy.golang.org/${prog}/@v/list" 2>/dev/null)
+   fi
+   # Go versions are prefixed with 'v' (v1.2.3) and the failure/edge paths can
+   # leak stray tokens ("not found", ...). Normalize and keep only real
+   # digit-dot versions so GuessLatest/In_Version_Range see sane input.
+   for V in $versions
+   do
+      V=$(echo "$V" | sed 's/^v//')
+      case "$V" in
+         [0-9]*[0-9]) ;;
+         [0-9]*) ;;
+         *) continue ;;
+      esac
+      if In_Version_Range "$lower" "$V" "$upper"
+      then
+         echo "$V"
+         return 0
+      fi
+   done
+   return 1
+}
+
+# --- install -----------------------------------------------------------------
+
+install() {
+   prog="$1"
+   ver="$2"
+   if [ ! -d "$GO_BIN" ]
+   then
+      mkdir -p "$GO_BIN" || {
+         echo "Alien-Go: failed to create $GO_BIN" >&2; exit 1
+      }
+   fi
+   if [ -n "$ver" ]
+   then
+      GOBIN="$GO_BIN" go install "${prog}@${ver}" || {
+         echo "Alien-Go: go install failed for ${prog}@${ver}" >&2
+         exit 1
+      }
+   else
+      GOBIN="$GO_BIN" go install "${prog}@latest" || {
+         echo "Alien-Go: go install failed for $prog" >&2
+         exit 1
+      }
+   fi
+   Symlink_Aliens "$goboExecutables" "$GO_BIN"
+}
+
+# --- dispatcher --------------------------------------------------------------
+
+case "$command" in
+   --getversion)
+      echo $(getversion "$prog")
+      ;;
+   --getinstallversion)
+      getinstallversion "$prog" "$3" "$4"
+      ;;
+   --greater-than)
+      ver=$(getversion "$prog")
+      latest=$(GuessLatest "$ver" "$3")
+      [ "$latest" = "$3" ] && exit 1 || exit 0
+      ;;
+   --met|--within-range|--interval)
+      ver=$(getversion "$prog")
+      In_Version_Range "$3" "$ver" "$4"
+      ;;
+   --have-manager)
+      which go >/dev/null 2>&1 || exit 1
+      ;;
+   --get-manager-rule)
+      gover=$(go version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
+      [ -n "$gover" ] || gover="1.0"
+      echo "Go >= $gover"
+      ;;
+   --install)
+      install "$prog" "$3"
+      ;;
+   --remove)
+      bin="$GO_BIN/$(basename "$prog")"
+      [ -f "$bin" ] && rm -f "$bin"
+      find "$GO_BIN" -maxdepth 0 -empty 2>/dev/null -delete
+      Cleanup_Aliens
+      ;;
+esac

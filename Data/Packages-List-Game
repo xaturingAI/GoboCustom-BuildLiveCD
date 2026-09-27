@@ -1,0 +1,73 @@
+# Packages for the Gaming Live CD.
+#
+# One package name per line; lines starting with '#' are ignored.
+# BuildRoot requires every listed package to exist as a binary package in
+# the Packages directory (see bin/BuildRoot). Build the recipes with
+# CreatePackage after compiling each one.
+#
+# Build order matters for the kernel modules: Linux first, then Nvidia
+# (its recipe compiles modules against the installed kernel).
+
+Linux
+Glibc
+Glibc-32
+
+# 32-bit X11 libraries (Steam client + games UI)
+Lib32-X11
+Lib32-Xext
+Lib32-Xrandr
+Lib32-Xinerama
+Lib32-Xcursor
+Lib32-Xi
+Lib32-Xcomposite
+Lib32-Xdamage
+Lib32-Xss
+Lib32-Xfixes
+Lib32-Xtst
+
+# 32-bit system libraries
+Lib32-DBus
+Lib32-FreeType
+Lib32-Fontconfig
+Lib32-libpng
+Lib32-zlib
+Lib32-libxml2
+Lib32-expat
+Lib32-libxcb
+Lib32-libgcc
+Lib32-libstdcpp
+
+# 32-bit audio libraries (Wine/Proton sound)
+Lib32-alsa-lib
+Lib32-libpulse
+Lib32-libsndfile
+
+# 32-bit keyboard handling
+Lib32-xkbcommon
+
+# 32-bit GL/Vulkan dispatch + Mesa (Wine/Proton rendering)
+Lib32-libglvnd
+Lib32-mesa
+Lib32-vulkan-loader
+
+# 32-bit SDL2 (games + Steam)
+Lib32-SDL2
+
+# Vulkan SDK
+Vulkan-Headers
+Vulkan-Loader
+Vulkan-Tools
+
+# NVIDIA driver (64+32-bit, kernel modules, Vulkan ICD)
+Nvidia
+
+# Steam client
+Steam
+
+# Wine is a source-build alternative to the prebuilt Proton used with Steam;
+# if built, uncomment the next line:
+#Wine
+#
+# Proton itself is not a separate package: a prebuilt Proton (e.g.
+# GE-Proton11-3) is baked into the Steam package via "bin/AddProton" and ships
+# in /Users/root/.local/share/Steam/compatibilitytools.d/.

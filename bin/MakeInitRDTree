@@ -1,0 +1,255 @@
+#!/bin/bash
+
+source $(dirname $0)/CompatFunctions
+
+helpOnNoArguments=no
+scriptDescription="Builds the GoboLinux LiveCD InitRD tree."
+scriptCredits="(C)2003-2009 by Hisham Muhammad et al. Released under the GNU GPL."
+scriptUsage="[options]"
+
+Add_Option_Boolean "i" "use-system-index" "Generate a tree using the /System/Index layout."
+Parse_Options "$@"
+
+unset usesystemindex
+Boolean "use-system-index" && usesystemindex=true
+
+
+####################################################
+# Operation
+####################################################
+if [ "$UID" != 0 ]
+then
+   echo "Must be run as superuser."
+   exit 1
+fi
+
+root=$PWD/Output/InitRD
+rolayer=$PWD/Output/ROLayer
+archives=$PWD/Archives/
+
+rm -rf $root
+mkdir -p $root
+
+scriptsVersion=$(ls $rolayer/Programs/Scripts/ | grep -v "Current\|Settings\|Variable")
+source $rolayer/Programs/Scripts/$scriptsVersion/Functions/Bootstrap
+
+
+####################################################
+# Fetch packages
+####################################################
+
+today=`date +%Y%m%d`
+arch=`uname -m`
+
+packages=(
+   $(basename $(ls $archives/BusyBox-InitRD--*--$arch.tar.bz2))
+   InitRDScripts--$today-GIT--$arch.tar.bz2
+)
+
+kernel_modules=(
+    lpc-ich
+    ehci
+    ohci
+    sdhci
+    usb-storage
+    usb-common
+    usbcore
+    bcma
+    fotg210
+    fusbh200
+    mmc_block
+    mmc_core
+    isp116x
+    isp1362
+    oxu210hp
+    r8a66597
+    sl811
+    ssb
+    u132
+    ufshcd
+    uhci
+    vhci
+    whci
+    xhci
+    overlay
+    uas
+    squashfs
+)
+
+cd $root
+
+####################################################
+# Directory structure
+####################################################
+
+Create_Filesystem_Tree $root root $usesystemindex
+
+rmdir $root/Mount/*
+mkdir -p $root/Mount/HD0
+mkdir -p $root/Mount/HD1
+mkdir -p $root/Mount/HD2
+mkdir -p $root/Mount/Media
+mkdir -p $root/Mount/.Pivot
+mkdir -p $root/Mount/TmpFS
+mkdir -p $root/Mount/UnionFS
+mkdir -p $root/Mount/SquashFS
+mkdir -p $root/Mount/CD-ROM
+
+
+####################################################
+# Some additional links
+####################################################
+
+ln -nfs ../../proc/mounts $root/System/Settings/mtab
+ln -nfs bin/startGoboLinux $root/linuxrc 
+
+####################################################
+# Nano-InstallPackage
+####################################################
+
+cd $root/Programs
+
+for package in "${packages[@]}"
+do
+   echo "Installing $package inside InitRD..."
+   tar xjpf $archives/$package || Die "Could not install $package."
+done
+
+####################################################
+# Nano-SymlinkProgram
+####################################################
+
+cd $root
+
+if [ "$usesystemindex" ]
+then bindir=usr/bin
+else bindir=System/Links/Executables
+fi
+
+ls -d Programs/*/Current/bin/* Programs/*/Current/sbin/* | while read i
+do
+   ln -nfs /$i $bindir/
+done
+
+####################################################
+# Populate /System/Kernel/Devices
+####################################################
+
+Create_Device_Nodes $root
+
+####################################################
+# Install required kernel modules
+####################################################
+
+kernelversion=$(basename "$(readlink -f "$rolayer/Programs/Linux/Current")")
+initrd_moddir="${root}/lib/modules/${kernelversion}-Gobo"
+mkdir -p "${initrd_moddir}/kernel"
+
+modulesdir="${rolayer}/Programs/Linux/Current/lib/modules/${kernelversion}-Gobo"
+if [ "$kernel_modules" ]
+then
+   # Satisfy depmod needs
+   [ -e "${modulesdir}/modules.order" ] && cp "${modulesdir}/modules.order" "$initrd_moddir"
+   [ -e "${modulesdir}/modules.builtin" ] && cp "${modulesdir}/modules.builtin" "$initrd_moddir"
+
+   for module in "${kernel_modules[@]}"
+   do
+      Quiet pushd "${modulesdir}/kernel"
+      modpath=( $(find -name "${module}*.ko" -or -name "${module}*.ko.xz") )
+      Quiet popd
+      [ -z "$modpath" ] && continue
+      for mod in "${modpath[@]}"
+      do
+         mkdir -p "${initrd_moddir}/kernel/$(dirname ${mod})"
+         cp --remove-destination \
+            ${modulesdir}/kernel/${mod} \
+            ${initrd_moddir}/kernel/${mod}
+         if echo "${mod}" | grep -q ".xz"
+         then
+            xz -d "${initrd_moddir}/kernel/${mod}"
+         fi
+      done
+   done
+fi
+
+####################################################
+# Populate /System/Settings
+####################################################
+
+cat <<EOF > $root/System/Settings/fstab
+/dev/ram0       /                      ext2    defaults
+none            /proc                  proc    defaults
+/lib/modules    /System/Kernel/Modules none    bind 0 0
+EOF
+
+cat <<EOF > $root/System/Settings/group
+root:x:0:
+EOF
+
+cat <<EOF > $root/System/Settings/hostname
+mini-GoboLinux
+EOF
+
+cat <<EOF > $root/System/Settings/inittab
+::sysinit:/bin/startGoboLinux
+::respawn:-/bin/ash
+tty2::askfirst:-/bin/ash
+tty3::askfirst:-/bin/ash
+tty4::askfirst:-/bin/ash
+tty5::askfirst:-/bin/ash
+tty6::askfirst:-/bin/ash
+
+::ctrlaltdel:/sbin/reboot
+::shutdown:/bin/umount -a -r
+::shutdown:/sbin/swapoff -a
+EOF
+
+cat <<EOF > $root/System/Settings/passwd
+root:x:0:0::/Users/root:/bin/ash
+bin:x:1:1:bin:/bin:
+daemon:x:2:2:daemon:/sbin:
+sync:x:5:0:sync:/sbin:/bin/sync
+uucp:x:10:14:uucp:/var/spool/uucppublic:
+nobody:x:99:99:nobody:/:
+EOF
+
+cat <<EOF > $root/System/Settings/profile
+TERM=linux
+PATH="/System/Index/bin"
+#PS1="\w>$"
+PS1='\[\033[1;33;41m\]RAMdisk\[\033[1;31;49m\] \w]\[\033[0m\]'
+PS2='> '
+export TERM PATH PS1 PS2
+
+date +"%d/%m %H:%M:%S"
+alias l='ls -l'
+
+if [ "\$(basename \$TTY)" = "tty4" ]
+then
+   /bin/chroot /Mount/SquashFS /usr/bin/env -i HOME=/Users/root TERM=linux /bin/zsh
+else
+   exec /bin/chroot /Mount/SquashFS /usr/bin/env -i HOME=/Users/root TERM=linux /bin/zsh
+fi
+EOF
+
+cat <<EOF > $root/System/Settings/rc
+#!/bin/ash
+/bin/mount -av
+/bin/startGoboLinux 
+EOF
+chmod +x $root/System/Settings/rc
+
+cat <<EOF > $root/System/Settings/shadow
+root::11501:0:::::
+
+bin:*:9797:0:::::
+daemon:*:9797:0:::::
+sync:*:9797:0:::::
+uucp:*:9797:0:::::
+nobody:*:9797:0:::::
+EOF
+
+cat <<EOF > $root/System/Settings/shells
+/bin/sh
+/bin/ash
+EOF

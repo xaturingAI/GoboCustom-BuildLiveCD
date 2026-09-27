@@ -1,0 +1,528 @@
+#!/bin/bash
+
+scriptName="CompressAndBuildISO"
+source $(dirname $0)/CompatFunctions
+
+helpOnNoArguments=no
+scriptDescription="Automated program compilation tool."
+scriptCredits="(C)2003-2007 by Hisham Muhammad et al. Released under the GNU GPL."
+scriptUsage="[<start_stage> [<end_stage>]]"
+scriptNotes="   where stage can be: rolayer, squashfs, initrd, iso.
+   For more information, see http://gobolinux.org/?page=livecd"
+
+Parse_Options "$@"
+Parse_Conf BuildLiveCD.conf
+
+export SHELL=/bin/bash
+export PATH=$PATH:/usr/sbin
+
+tar --help | grep -q -- --overwrite || Die "Your version of tar is too old. Please upgrade."
+unionfs --version >& /dev/null || Die "Please install the unionfs-fuse package first."
+
+# Stages:
+STAGE_ROLAYER=0; STAGE_SQUASHFS=1; STAGE_INITRD=2; STAGE_ISO=3
+
+if [ "$(Arg 1)" ]
+then
+   case "$(Arg 1)" in
+   "rolayer")  start_at=$STAGE_ROLAYER;;
+   "squashfs") start_at=$STAGE_SQUASHFS;;
+   "initrd")   start_at=$STAGE_INITRD;;
+   "iso")      start_at=$STAGE_ISO;;
+   *)          Die "Invalid start stage \"$(Arg 1)\""
+   esac
+else
+   start_at=$STAGE_ROLAYER
+fi
+ 
+if [ "$(Arg 2)" ]
+then
+   case "$(Arg 2)" in
+   "rolayer")  stop_at=$STAGE_ROLAYER;;
+   "squashfs") stop_at=$STAGE_SQUASHFS;;
+   "initrd")   stop_at=$STAGE_INITRD;;
+   "iso")      stop_at=$STAGE_ISO;;
+   *)          Die "Invalid stop stage \"$(Arg 2)\""
+   esac
+else
+   stop_at=$STAGE_ISO
+fi
+
+Verify_Superuser
+
+root=$PWD
+today=`date +%Y%m%d`
+localgit=$root/LocalGit
+packages=$root/Packages
+datadir="$(readlink -f $(dirname $0)/../Data)"
+arch=$(ls $packages/*.bz2 | tail -n1 | sed 's,\(.*\)--\(.*\)--\(.*\).tar.bz2,\3,g')
+unset verbose
+
+if [ "$arch" != "$(uname -m)" ]
+then
+   echo "Error: some GoboLinux tools packages must be compiled on demand, but the current"
+   echo "architecture ($(uname -m)) differs from that targeted by the tarballs stored in"
+   echo "the Packages directory ($(arch))."
+   exit 1
+fi
+
+unset usesystemindex
+[ "$livecdUseSystemIndex" = "true" ] && usesystemindex="true"
+
+if [ "$usesystemindex" ]
+then filesdir=Data
+else filesdir=Files
+fi
+
+function measure_time() {
+   if [ "$verbose" ]
+   then
+      # Need to do return code hack because time returns 0
+      rtn_file=`mktemp /tmp/BuildLiveCD_return.XXXXXXX`
+      time ("$@"; echo $? >$rtn_file)
+      rtn=`cat $rtn_file`
+      rm -f $rtn_file
+   else
+      "$@"
+      rtn=$?
+   fi
+   return $rtn
+}
+
+function in_rolayer() {
+   local rolayer="${root}/Output/ROLayer"
+   local scriptsVersion=$(ls ${rolayer}/Programs/Scripts/ | grep -v "Current\|Settings\|Variable")
+   local pythonversion=$(basename ${rolayer}/Programs/Scripts/${scriptsVersion}/lib/python*)
+   cat << EOF > "${rolayer}/tmp/in_rolayer.sh"
+export "PYTHONPATH=$PYTHONPATH:/Programs/Scripts/${scriptsVersion}/lib/$pythonversion/site-packages"
+export "PATH=$PATH:/Programs/Scripts/${scriptsVersion}/bin"
+source "/Programs/Scripts/${scriptsVersion}/bin/GoboPath"
+source "/System/Environment/Cache"
+$@
+EOF
+   # Borrow resolv.conf from the host so that we have network access inside the ROLayer
+   mv "${root}/Output/ROLayer/System/Settings/resolv.conf" "${root}/Output/ROLayer/System/Settings/resolv.conf.orig"
+   cp /etc/resolv.conf "${root}/Output/ROLayer/System/Settings/resolv.conf"
+
+   chmod +x "${rolayer}/tmp/in_rolayer.sh"
+   chroot "${rolayer}" /tmp/in_rolayer.sh
+   ret=$?
+   rm -f "${rolayer}/tmp/in_rolayer.sh"
+
+   # Rollback changes to resolv.conf
+   mv "${root}/Output/ROLayer/System/Settings/resolv.conf.orig" "${root}/Output/ROLayer/System/Settings/resolv.conf"
+   return $ret
+}
+
+function create_gobo_package_from_programs() {
+   local package="$1"
+   local tarball=$package--${today}-GIT--$arch.tar.bz2
+   Quiet pushd "${root}/Output/ROLayer/Programs/"
+   tar cjpf "$packages/$tarball" $package/${today}-GIT
+   Quiet popd
+}
+
+function create_gobo_package_from_git() {
+   local package="$1"
+   local tarball=$package--${today}-GIT--$arch.tar.bz2
+   local ret=0
+   Quiet pushd "$packages"
+   if [ ! -e "$tarball" -o "`find "$localgit/tools/$package/" -newer "$tarball" 2> /dev/null`" ]
+   then
+      echo "Packing $package Git snapshot..."
+      rm -rf -- $package                    # only required if there are leftovers from a previous execution
+      mkdir -p $package
+      cp -a $localgit/tools/$package $package/${today}-GIT
+      find $package/${today}-GIT/ -type d -name .git | xargs rm -rf
+      rm -f $package--*--$arch.tar.bz2         # cleaning up old versions too
+      tar cjpf $tarball $package/${today}-GIT  # create the package
+      rm -rf -- $package
+   else
+      echo "Not repacking $package Git snapshot..."
+      ret=1
+   fi
+   Quiet popd
+   return $ret
+}
+
+#############################################################################
+# ROLayer
+#############################################################################
+if [ "$start_at" -le "$STAGE_ROLAYER" ] && [ "$stop_at" -ge "$STAGE_ROLAYER" ]
+then
+   Log_Normal "=> ROLayer stage started"
+
+   if ! [ -e LocalGit -a -e Packages -a -e Archives ]
+   then
+      echo 'Basic directories could not be found.'
+      echo 'Please check if you are running the script inside a directory populated by UpdateEnviromnent'
+      exit 1
+   fi
+
+   if [ -e $datadir/Packages-List-GoboLinuxTools-Git ]
+   then tools=`cat $datadir/Packages-List-GoboLinuxTools-Git`
+   else tools=
+   fi
+
+   if echo "$tools" | grep -q Scripts
+   then toolswhichneedmake="Scripts"
+   else toolswhichneedmake=
+   fi
+
+   for package in $tools 
+   do
+      # Create a binary package of the GoboLinux tool
+      create_gobo_package_from_git "$package" && toolswhichneedmake="$toolswhichneedmake $package"
+
+      # Remove old snapshots of the GoboLinux packages from ROLayer
+      ls "${root}/Output/ROLayer/Programs/$package/" 2> /dev/null | grep -v "Settings\|Current\|Variable\|$today" | while read pkgversion
+      do
+         Log_Normal "Removing old snapshot $pkgversion from $package"
+         rm -rf -- "${root}/Output/ROLayer/Programs/$package/$pkgversion"
+      done
+   done
+
+   Log_Normal "Building root..."
+   unset buildrootopts
+   [ "$usesystemindex" ] && buildrootopts="--use-system-index"
+   BuildRoot --root="Output/ROLayer" --packagedir="Packages" $buildrootopts $datadir/Packages-List-* || exit 1
+
+   scriptsVersion=$(ls ${root}/Output/ROLayer/Programs/Scripts/ | grep -v "Current\|Settings\|Variable")
+   scriptsdir="$root/Output/ROLayer/Programs/Scripts/${scriptsVersion}"
+   
+   Log_Normal "Installing Aliens"
+   if [ -e "$scriptsdir/Makefile" ]
+   then
+      # The Aliens script needs to import Python modules from the Scripts package
+      in_rolayer make -C /Programs/Scripts/$scriptsVersion/ clean >& /dev/null
+      in_rolayer make -C /Programs/Scripts/$scriptsVersion/ python > /dev/null
+   fi
+
+   # Must bind-mount so that the union-mount doesn't deadlock
+   mkdir -p "${root}/Output/ROLayer/System/Aliens/"
+   mkdir -p "${root}/Output/ROLayer/System/Aliens-bindmount"
+   mount -o bind "${root}/Output/ROLayer/System/Aliens/" "${root}/Output/ROLayer/System/Aliens-bindmount"
+
+   exec 3<> "$datadir/Aliens-Packages-List"
+   while read line <&3
+   do
+      line="$(echo "${line}" | sed -r -e 's,\W*#.*,,' -e '/^\W*$/d')"
+      [ -z "${line}" ] && continue
+      alien="$(echo "${line}" | awk '{ print $1 }')"
+      version="$(echo "${line}" | awk '{ print $2 }')"
+
+      unset ualiens
+      for unmanaged_aliens in $(readlink -f "${root}"/Output/ROLayer/Programs/*/Current/Resources/Unmanaged/System/Aliens 2> /dev/null)
+      do
+         ualiens="${ualiens:+${ualiens}:}${unmanaged_aliens}=ro"
+      done
+      
+      unionfs -o nonempty,dirs=${root}/Output/ROLayer/System/Aliens-bindmount=rw:${ualiens} "${root}/Output/ROLayer/System/Aliens"
+      if ! in_rolayer Alien --met "${alien}" ${version} > /dev/null
+      then
+         echo "Installing ${alien}"
+         in_rolayer Alien --install "${alien}" ${version} >/dev/null
+      else
+         echo "Keeping ${alien} $(in_rolayer Alien --getversion "${alien}")"
+      fi
+      umount "${root}/Output/ROLayer/System/Aliens"
+   done
+
+   umount "${root}/Output/ROLayer/System/Aliens-bindmount"
+   rmdir "${root}/Output/ROLayer/System/Aliens-bindmount"
+
+   for package in $tools
+   do
+      # we build the tools again to ensure they are prepared to the LiveCD environment
+      if [ -e Output/ROLayer/Programs/$package/${today}-GIT/Makefile ] && echo "$toolswhichneedmake" | grep -q "$package"
+      then
+         echo "Rebuilding $package..."
+         in_rolayer make -C Programs/$package/${today}-GIT/ clean >& /dev/null
+         in_rolayer make -C Programs/$package/${today}-GIT/ > /dev/null
+         create_gobo_package_from_programs "$package"
+         # Symlink it
+         goboPrefix="$root/Output/ROLayer" \
+         LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$root/Output/ROLayer/lib" \
+         PATH="$PATH:${scriptsdir}/bin:${scriptsdir}/src:${scriptsdir}/Functions" \
+         ${scriptsdir}/bin/SymlinkProgram --relative --terse --no-follow --unmanaged=skip --no-requirements $package ${today}-GIT
+      fi
+   done
+   # Move Scripts executables from src/ into bin/
+   for i in $(find "$scriptsdir"/src -type f -executable 2> /dev/null)
+   do
+       mv -v $i $(dirname $(dirname $i))/bin
+   done
+
+   # Regenerate module dependency info now that every driver package (e.g.
+   # NVIDIA) is in place, so modprobe finds all modules on the Live CD.
+   if [ -d "${root}/Output/ROLayer/lib/modules" ]
+   then
+      for kernelrelease in $(ls -1 "${root}/Output/ROLayer/lib/modules" 2> /dev/null)
+      do
+         Log_Normal "Regenerating module dependencies for $kernelrelease"
+         depmod -b "${root}/Output/ROLayer" "$kernelrelease" 2> /dev/null || true
+      done
+   fi
+
+   Log_Normal "=> ROLayer stage done"
+fi
+
+#############################################################################
+# Squashfs
+#############################################################################
+if [ "$start_at" -le "$STAGE_SQUASHFS" ] && [ "$stop_at" -ge "$STAGE_SQUASHFS" ]
+then
+   echo "=> SquashFS stage started"
+   squashfsmajor=`mksquashfs -version 2> /dev/null | head -n 1 | awk {'print $3'} | cut -d. -f1`
+   if [ ! "$squashfsmajor" ] || [ $squashfsmajor -lt 4 ]
+   then
+      echo "You need to install SquashFS-Tools version 4.0 or above."
+      exit 1
+   fi
+
+   build_layers=(
+      "Output/RWLayer=ro"
+      "Output/ROLayer=ro"
+   )
+   unionfs_dirs=`echo "${build_layers[@]}" | tr " " ":"`
+   mkdir -p Output/Environment
+   mkdir -p Output/RWLayer
+   echo "Unionfs mounting layers."
+   tmp_mp=`mktemp -d /tmp/finalize_layer-XXXXX`
+   unionfs_dirs="dirs=${unionfs_dirs}:${tmp_mp}=rw"
+   unionfs -o cow,${unionfs_dirs} Output/Environment || { echo Error mounting Output/Environment; exit 1; }
+
+   mkdir -p Output/Checksums
+   
+   function ld_so_cache_changed() {
+      if grep -q "Programs/Glibc/Settings/ld.so.cache" /tmp/newer.txt
+      then
+         diff ../ld.so.cache.sum ../ld.so.cache.sum.old &> /dev/null
+         if [ $? -ne 0 ]
+         then
+            cp ../ld.so.cache.sum ../ld.so.cache.sum.old
+            return 0
+         fi
+      fi
+      return 1
+   }
+
+   function mksquashfs_on_demand() {
+      out="$1"
+      dirs="$2"
+      searchdirs="$3"
+      blacklist="$4"
+
+      bn=`basename "$out"`
+      [ -z "$searchdirs" ] && searchdirs="$dirs"
+      diffs=0
+      if [ -e "$out" ]
+      then
+         echo "Checking if $bn needs updating..."
+         Quiet pushd "$root/Output/ROLayer"
+         find $searchdirs -newer "$out" 2> /dev/null > /tmp/newer.txt
+         Quiet popd
+         Quiet pushd "$root/Output/RWLayer"
+         find $searchdirs -newer "$out" 2> /dev/null >> /tmp/newer.txt
+         Quiet popd
+         diffs=`cat /tmp/newer.txt | grep -v "^Programs/Glibc$\|^Programs/Glibc/Settings$\|^Programs/Glibc/Settings/ld.so.cache$\|^Data/Variable/cache/ldconfig$\|^Data/Variable/cache/ldconfig/aux-cache$" | wc -l`
+         ld_so_cache_changed
+         
+         if [ $diffs -ne 0 -a "$verbose" ]
+         then
+            echo ==========
+            echo Changes:
+            echo ----------
+            if [ $(wc -l /tmp/newer.txt | awk {'print $1'}) -gt 16 ]
+            then echo "(too many changes to show)"
+            else cat /tmp/newer.txt
+            fi
+            echo ==========
+         fi
+      fi
+      if [ ! -e "$out" ] || [ $diffs -gt 0 ] || ld_so_cache_changed
+      then
+         echo "Creating squashfs compressed file $bn..."
+         compressor="-comp xz -Xbcj x86"
+         Quiet rm $out
+         if [ "$verbose" ]
+         then nice -20 mksquashfs $dirs "$out" $compressor -noappend -no-sparse -keep-as-directory ${blacklist:+-wildcards -e $blacklist}
+         else Quiet nice -20 mksquashfs $dirs "$out" $compressor -noappend -no-sparse -keep-as-directory ${blacklist:+-wildcards -e $blacklist}
+         fi
+         rtn=1  # Created squashfs file
+      else
+         echo "Mksquashfs not needed for $bn."
+         rtn=2  # No need to recreate file
+      fi
+      rm -f /tmp/newer.txt
+      return $rtn # 1=File recreated   2=File same
+   }
+
+   # Final actions on Environment
+   chroot Output/Environment /bin/ldconfig
+   md5sum Output/Environment/Programs/Glibc/Settings/ld.so.cache > Output/ld.so.cache.sum
+
+   # compress the uncompressed files into squashfs files
+   mkdir -p Output/ISO
+   Quiet pushd Output/Environment
+   rm -rf "$root/Output/ROLayer/$filesdir/Variable/tmp/*"
+   rm -rf "$root/Output/RoLayer/$filesdir/Variable/tmp/.[^.]*"
+   measure_time mksquashfs_on_demand $root/Output/ISO/GoboLinux-files.squashfs $filesdir
+
+   for i in $datadir/Packages-List-*; do 
+      squashfile=$root/Output/ISO/`basename $i`.squashfs
+      if [ "$i" -nt "$squashfile" ]
+      then
+         echo "$i is more recent than $squashfile."
+         echo "Deleting $squashfile to force regeneration."
+         rm -f "$squashfile"
+      fi
+      # Skip comments
+      applist=`cat $i | cut -f1 -d' ' | grep -v "^#" | sort -u | while read i; do [ ! -z "$i" ] && echo $i; done`
+
+      if [ -z "$applist" ]
+      then continue
+      fi
+      searchdirs=`for i in $applist; do echo Programs/$i; done | tr -s '\n' ' '`
+
+      # Conditionally regen squashfs.
+      measure_time mksquashfs_on_demand $squashfile "$searchdirs" "" ""
+      rtn=$?
+
+      # If the squashfs was generated, it contains Packagename dirs rather than Programs/Foo
+      # If we append to an existing squashfs -root-becomes allows the root to be reassigned
+      # in this case, Programs
+      empty_dir=`mktemp -d /tmp/BuildLiveCD-emptydir.XXXXX`
+      chmod a+rx "${empty_dir}"
+      [ "$rtn" == "1" ] && Quiet mksquashfs $empty_dir $squashfile -root-becomes Programs
+      rmdir $empty_dir
+   done
+
+   contents="$(ls --hide="$filesdir" --hide="Programs" --hide="Users" --hide="home" | tr -s '\n' ' ')"
+   measure_time mksquashfs_on_demand $root/Output/ISO/GoboLinux-rest.squashfs "$contents" "" "System/Aliens*"
+   measure_time mksquashfs_on_demand $root/Output/ISO/GoboLinux-aliens.squashfs "System/Aliens" "" ""
+   if [ $? == 1 ]
+   then
+      empty_dir=$(mktemp -d /tmp/BuildLiveCD-emptydir.XXXXX)
+      chmod a+rx "${empty_dir}"
+      Quiet mksquashfs $empty_dir ../ISO/GoboLinux-aliens.squashfs -root-becomes System
+      rmdir $empty_dir
+   fi
+   Quiet popd # Output/Environment
+
+   umount Output/Environment
+   rmdir Output/Environment
+   rm -rf $tmp_mp 2> /dev/null
+   echo "=> SquashFS stage done"
+fi
+
+#############################################################################
+# InitRD
+#############################################################################
+if [ "$start_at" -le "$STAGE_INITRD" ] && [ "$stop_at" -ge "$STAGE_INITRD" ]
+then
+   echo "=> InitRD stage started"
+
+   if ! [ -e Archives ]
+   then
+      echo 'Basic directory Archives could not be found.'
+      echo 'Please check if you are running the script inside a directory populated by UpdateEnviromnent'
+      exit 1
+   fi
+
+   # Rebuild initrd
+   initrd_dir=Output/InitRD
+
+   Quiet pushd Archives
+   for package in InitRDScripts
+   do
+      echo "Packing $package Git snapshot..."
+      tarball=$package--${today}-GIT--$arch.tar.bz2
+      rm -rf "$package" "$package"--*
+      mkdir -p $package/${today}-GIT
+      cp -a $localgit/tools/$package/* $package/${today}-GIT
+
+      Quiet pushd $package/${today}-GIT
+      [ -e Makefile ] && make > /dev/null
+      find -type d -name .git | xargs rm -rf 
+      ln -nfs ${today}-GIT ../Current
+      Quiet popd
+
+      rm -f $tarball
+      tar cjpf $tarball $package
+      rm -rf $package
+   done
+   Quiet popd
+
+   unset makeinitrdopts 
+   [ "$usesystemindex" ] && makeinitrdopts="--use-system-index"
+   MakeInitRDTree $makeinitrdopts || Die "Failed creating initrd environment."
+
+   echo "Copying isolinux/kernel from Output/ROLayer/System/Kernel/Boot/kernel"
+   cp --remove-destination Output/ROLayer/Programs/Linux/Current/Resources/Unmanaged/System/Kernel/Boot/kernel Output/ISO/isolinux/kernel
+   /sbin/mkfs.cramfs $initrd_dir Output/ISO/isolinux/initrd
+   echo "=> InitRD stage done"
+fi
+
+#############################################################################
+# ISO
+#############################################################################
+if [ "$start_at" -le "$STAGE_ISO" ] && [ "$stop_at" -ge "$STAGE_ISO" ]
+then
+   echo "=> ISO stage started"
+   echo "Generate md5sums"
+   Quiet pushd Output/ISO
+   md5sum isolinux/kernel isolinux/initrd *.squashfs >md5sums
+   Quiet popd
+
+   echo "Generate EFI application"
+   rwlayer="${root}/Output/RWLayer"
+   efiapp_name="Output/ISO/isolinux/BOOTx64.EFI"
+   cp "$datadir/grub-efi.cfg" "$rwlayer/"
+   cp "$datadir/splash.png" "$rwlayer/"
+
+   $(dirname $0)/ChrootEnvironment grub-mkstandalone-efi \
+     -d "/lib/grub/x86_64-efi" \
+     -O x86_64-efi \
+     --modules="part_gpt part_msdos iso9660 all_video efi_gop efi_uga gfxterm gettext font png gfxterm_background" \
+     --fonts="unicode" \
+     --themes="" \
+     -o "/$(basename $efiapp_name)" \
+     --compress=gz \
+     "boot/grub/grub.cfg=/grub-efi.cfg" \
+     "boot/grub/splash.png=/splash.png"
+   rm -f "$rwlayer/grub-efi.cfg" "$rwlayer/splash.png"
+   mv "$rwlayer/$(basename $efiapp_name)" "$efiapp_name" || exit 1
+
+   echo "Create EFI boot image"
+   efi_mp=`mktemp -d /tmp/efiboot_XXXXX`
+   dd if=/dev/zero of=Output/ISO/isolinux/efiboot.img bs=1M count=16
+   /sbin/mkfs.fat -F 16 -n "EFI_BOOT" Output/ISO/isolinux/efiboot.img
+   mount -t vfat Output/ISO/isolinux/efiboot.img "$efi_mp"
+   mkdir -p "$efi_mp/EFI/BOOT/"
+   cp "$efiapp_name" "$efi_mp/EFI/BOOT/"
+   cp "$datadir/GoboLinuxVolumeIcon.icns"  "$efi_mp/.VolumeIcon.icns"
+   umount "$efi_mp"
+   rmdir "$efi_mp"
+   rm -f "$efiapp_name"
+
+   echo "Generate ISO"
+   iso_name="$PWD/Output/GoboLinux-NoVersion.iso"
+   measure_time nice -20 \
+       genisoimage \
+       -R \
+       -b isolinux/isolinux.bin \
+       -c isolinux/boot.cat \
+       -no-emul-boot \
+       -boot-load-size 4 \
+       -boot-info-table \
+       -input-charset utf-8 \
+       -appid "GoboLinux Live Installer" \
+       -V "GoboLinux Live Installer" \
+       -publisher "GoboLinux.org" \
+       -p "Gobo Himself" \
+       -eltorito-alt-boot -e isolinux/efiboot.img -no-emul-boot \
+       Output/ISO  > $iso_name
+   isohybrid --uefi "$iso_name"
+   echo "=> ISO stage done"
+fi
